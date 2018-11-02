@@ -1,98 +1,178 @@
 import tensorflow as tf
-import numpy as np
 
-initializer = tf.variance_scaling_initializer()
+initializer = tf.random_normal_initializer(0., 0.02)
 activation_fn = tf.nn.elu
-lr = 1e-3
-gamma = 0.95
 
-class BEGAN:
+class BEGAN():
+    def __init__(self, batch_size, data_size, filters, input_size, embedding, gamma):
 
-    def __init__(self, num_filters, num_units, dim_latent):
-        self.num_filters = num_filters
-        self.num_units = num_units
+        self.batch_size = batch_size
+        self.data_size = data_size
+        self.mm = 0.5
+        self.mm2 = 0.999
+        self.lamda = 1e-3
+        self.gamma = gamma
+        self.filter_number = filters
+        self.input_size = input_size
+        self.embedding = embedding
 
-        self.input      = tf.placeholder(dtype=tf.float32, shape=(None, 64, 64, 4))
-        self.z          = tf.placeholder(dtype=tf.float32, shape=(None, dim_latent))
-        self.k          = tf.placeholder(dtype=tf.float32)
-        self.multiplier = tf.placeholder(dtype=tf.float32)
+        self._build_model()
 
-    def encoder(self):
-        # variable scope for discriminator
-        with tf.variable_scope("encoder", reuse=tf.AUTO_REUSE) as scope:
-            # first conv layer : [-1, 64, 64, n]
-            hidden = tf.layers.conv2d(inputs=self.input, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            # second layer -> output : [-1, 32, 32, 2 * n]
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=2 * self.num_filters, kernel_size=(3, 3), strides=(2, 2), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            # third layer -> output : [-1, 16, 16, 3 * n]
-            hidden = tf.layers.conv2d(inputs=hidden, filters=2 * self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=3 * self.num_filters, kernel_size=(3, 3), strides=(2, 2), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            # fourth layer -> output : [-1, 16, 16, 3 * n]
-            hidden = tf.layers.conv2d(inputs=hidden, filters=3 * self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=3 * self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            # fully connected layer
-            embedding = tf.reshape(tensor=hidden, shape=(-1, 16 * 16 * 3 * self.num_filters))
-            embedding = tf.layers.dense(inputs=embedding, units=self.num_units, activation=None, kernel_initializer=initializer)
-        return embedding
+    def _build_model(self):
+        # Input placeholder
+        self.x = tf.placeholder(tf.float32, shape=[self.batch_size, self.input_size], name='x')
+        self.y = tf.placeholder(tf.float32, shape=[self.batch_size, self.data_size, self.data_size, 3], name='y')
+        self.kt = tf.placeholder(tf.float32, name='kt')
+        self.lr = tf.placeholder(tf.float32, name='lr')
 
-    def generator_or_decoder(self, embedding, scope_name="decoder"):
-        # choose what to make
-        with tf.variable_scope(scope_name, reuse=tf.AUTO_REUSE) as scope:
-            # embedding to feature
-            h_0 = tf.layers.dense(inputs=embedding, units=16 * 16 * self.num_filters, activation=None, kernel_initializer=initializer)
-            h_0 = tf.reshape(tensor=h_0, shape=(-1, 16, 16, self.num_filters))
-            # first conv layer -> output : [-1, 32, 32, 2 * n]
-            hidden = tf.layers.conv2d(inputs=h_0, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            upsampled_hidden = tf.image.resize_nearest_neighbor(hidden, size=(32, 32))
-            upsampled_skip_connection = tf.image.resize_nearest_neighbor(h_0, size=(32, 32))
-            hidden = tf.concat([upsampled_hidden, upsampled_skip_connection], axis=3)
-            # second conv layer -> output : [-1, 64, 64, 2 * n]
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            upsampled_hidden = tf.image.resize_nearest_neighbor(hidden, size=(64, 64))
-            upsampled_skip_connection = tf.image.resize_nearest_neighbor(h_0, size=(64, 64))
-            hidden = tf.concat([upsampled_hidden, upsampled_skip_connection], axis=3)
-            # third conv layer -> output : [-1, 64, 64, n]
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            hidden = tf.layers.conv2d(inputs=hidden, filters=self.num_filters, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-            # final conv layer -> output : [-1, 64, 64, 4]
-            image = tf.layers.conv2d(inputs=hidden, filters=4, kernel_size=(3, 3), padding='same', activation=activation_fn, kernel_initializer=initializer)
-        return image
+        # Generator
+        self.recon_gen = self.generator(self.x)
 
-    def _loss(self, image):
-        # encode the image
-        embedding = self.encoder()
-        reconstructed = self.generator_or_decoder(embedding, "decoder")
-        # return the loss
-        return tf.reduce_mean(tf.abs(image - reconstructed))
+        # Discriminator (Critic)
+        d_real = self.decoder(self.encoder(self.y))
+        d_fake = self.decoder(self.encoder(self.recon_gen))
+        self.recon_dec = self.decoder(self.x)
 
-    def loss(self):
-        # the real image
-        d_real_loss = self._loss(image=self.input)
-        # the fake image
-        gen_fake = self.generator_or_decoder(self.z, scope_name="generater")
-        d_fake_loss = self._loss(gen_fake)
-        # for the discriminator
-        discriminator_loss  = d_real_loss - self.k * d_fake_loss
-        generater_loss      = d_fake_loss
-        m_global = d_real_loss + tf.abs(gamma * d_real_loss - d_fake_loss)
+        # Loss
+        self.d_real_loss = self.l1_loss(self.y, d_real)
+        self.d_fake_loss = self.l1_loss(self.recon_gen, d_fake)
+        self.d_loss = self.d_real_loss - self.kt * self.d_fake_loss
+        self.g_loss = self.d_fake_loss
+        self.m_global = self.d_real_loss + tf.abs(self.gamma * self.d_real_loss - self.d_fake_loss)
 
-        return discriminator_loss, generater_loss, m_global
+        # Variables
+        g_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, "gen")
+        d_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, "disc_")
+        for elem in g_vars:
+            print(elem)
+        for elem in d_vars:
+            print(elem)
 
-    def train(self):
-        # get both losses
-        discriminator_loss, generater_loss, m_global = self.loss()
-        # get the variables
-        encoder_vars = tf.trainable_variables(scope="encoder")
-        decoder_vars = tf.trainable_variables(scope="decoder")
-        auto_encoder_vars = encoder_vars + decoder_vars
-        generater_vars = tf.trainable_variables(scope="generater")
-        # use Adam optimizer
-        discriminator_train = tf.train.AdamOptimizer(learning_rate=lr).minimize(discriminator_loss, var_list=auto_encoder_vars)
-        generater_train     = tf.train.AdamOptimizer(learning_rate=lr).minimize(generater_loss, var_list=generater_vars)
+        # Optimizer
+        self.opt_g = tf.train.AdamOptimizer(self.lr, self.mm).minimize(self.g_loss, var_list=g_vars)
+        self.opt_d = tf.train.AdamOptimizer(self.lr, self.mm).minimize(self.d_loss, var_list=d_vars)
 
-        return discriminator_train, generater_train, discriminator_loss, generater_loss, m_global
+    def generator_ops(self):
+        return self.opt_g, self.g_loss, self.d_real_loss, self.d_fake_loss
 
+    def discriminator_ops(self):
+        return self.opt_d, self.d_loss
 
+    def generator(self, x):
+        with tf.variable_scope('gen', reuse=tf.AUTO_REUSE) as scope:
+
+            w = self.data_size
+            f = self.filter_number
+            p = "SAME"
+
+            x = tf.layers.dense(inputs=x, units=8 * 8 * f, activation=None, kernel_initializer=initializer)
+            x = tf.reshape(tensor=x, shape=(-1, 8, 8, f))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w / 4), int(w / 4)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w / 2), int(w / 2)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w), int(w)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=3, kernel_size=(3, 3), padding='same', activation=None,
+                                 kernel_initializer=initializer)
+        return x
+
+    def encoder(self, x):
+        with tf.variable_scope('disc_encoder', reuse=tf.AUTO_REUSE) as scope:
+            f = self.filter_number
+            h = self.embedding
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=2 * f, kernel_size=(3, 3), padding='same', activation=None,
+                                 kernel_initializer=initializer)
+            x = tf.layers.average_pooling2d(inputs=x, pool_size=(2, 2), strides=(2, 2), padding='same')
+            x = tf.layers.conv2d(inputs=x, filters=2 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=2 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=3 * f, kernel_size=(3, 3), padding='same', activation=None,
+                                 kernel_initializer=initializer)
+            x = tf.layers.average_pooling2d(inputs=x, pool_size=(2, 2), strides=(2, 2), padding='same')
+            x = tf.layers.conv2d(inputs=x, filters=3 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=3 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=4 * f, kernel_size=(3, 3), padding='same', activation=None,
+                                 kernel_initializer=initializer)
+            x = tf.layers.average_pooling2d(inputs=x, pool_size=(2, 2), strides=(2, 2), padding='same')
+            x = tf.layers.conv2d(inputs=x, filters=4 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=4 * f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.reshape(tensor=x, shape=(-1, 8 * 8 * 256))
+            x = tf.layers.dense(inputs=x, units=h, activation=None, kernel_initializer=initializer)
+
+        return x
+
+    def decoder(self, x):
+        with tf.variable_scope('disc_decoder', reuse=tf.AUTO_REUSE) as scope:
+
+            w = self.data_size
+            f = self.filter_number
+
+            x = tf.layers.dense(inputs=x, units=8 * 8 * f, activation=None, kernel_initializer=initializer)
+            x = tf.reshape(tensor=x, shape=(-1, 8, 8, f))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w / 4), int(w / 4)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w / 2), int(w / 2)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.image.resize_nearest_neighbor(images=x, size=(int(w), int(w)))
+
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+            x = tf.layers.conv2d(inputs=x, filters=f, kernel_size=(3, 3), padding='same', activation=activation_fn,
+                                 kernel_initializer=initializer)
+
+            x = tf.layers.conv2d(inputs=x, filters=3, kernel_size=(3, 3), padding='same', activation=None,
+                                 kernel_initializer=initializer)
+        return x
+
+    @staticmethod
+    def l1_loss(x, y):
+        return tf.reduce_mean(tf.abs(x - y))
